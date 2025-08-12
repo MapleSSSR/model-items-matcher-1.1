@@ -5,18 +5,17 @@ import streamlit as st
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.worksheet.table import TableColumn
 
 st.set_page_config(page_title="Model Number → Items Matcher (Preserve Format)", layout="wide")
-st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.2)")
+st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.3)")
 
 st.markdown("""
-**How it works**  
-- Edits your uploaded **A** workbook *in place* (using `openpyxl`) to preserve cell styles, column widths, filters, freeze panes, etc.  
-- Inserts a new **Items** column **right after “Model Number”** on each sheet that has that header (case-insensitive).  
-- **Matching rule**: For each token in A, find the **longest** `Model Number` from B that is **contained** in that token (case-insensitive). If none found → `N/A`.  
-- Ignores leading quantities like `49 x ...`, `289*...`. Supports multiple models separated by **`,`** (English) or **`，`** (Chinese).
-- If any token in a row is `N/A`, the **entire row is highlighted in red**.
+**Changes in v3.3**  
+- Do **not** extend the filter range downward anymore (keeps your sheet from showing blank formatted rows). We only widen the range to include the new `Items` column.  
+- If the **Model Number** header is inside an **Excel Table**, we also extend that **Table** (ref + `tableColumns`) to include the new `Items` column so total rows & structured formulas keep working.  
+- All other logic unchanged: longest **substring** match, row highlight on `N/A`, ignore leading quantities, multi-models with comma.
 """)
 
 with st.sidebar:
@@ -26,7 +25,7 @@ with st.sidebar:
     run = st.button("🚀 Run Matching (Preserve Format)", use_container_width=True)
 
 def _clean_leading_qty(txt: str) -> str:
-    return re.sub(r"^\s*\d+\s*[x\*]\s*", "", txt, flags=re.IGNORECASE)
+    return re.sub(r"^\\s*\\d+\\s*[x\\*]\\s*", "", txt, flags=re.IGNORECASE)
 
 def _split_models(cell: str):
     parts = re.split(r"[,\，]", cell)
@@ -63,10 +62,60 @@ def longest_substring_match(token: str, keys_sorted, keys_sorted_lower):
             return k
     return None
 
-def extend_autofilter_to_last_col(ws):
+def _parse_ref(ref: str):
+    # 'A1:Q999' -> ('A',1,'Q',999)
+    a, b = ref.split(":")
+    m1 = re.match(r"([A-Z]+)(\d+)", a)
+    m2 = re.match(r"([A-Z]+)(\d+)", b)
+    if not (m1 and m2):
+        return None
+    return m1.group(1), int(m1.group(2)), m2.group(1), int(m2.group(2))
+
+def widen_filter_columns_only(ws):
+    """Extend existing auto_filter to the rightmost used column,
+    but keep original start/end rows to avoid formatting many blank rows."""
     try:
         if ws.auto_filter and ws.auto_filter.ref:
-            ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+            start_col, start_row, end_col, end_row = _parse_ref(ws.auto_filter.ref)
+            if start_col is None:
+                return
+            new_end_col = get_column_letter(ws.max_column)
+            ws.auto_filter.ref = f"{start_col}{start_row}:{new_end_col}{end_row}"
+    except Exception:
+        pass
+
+def extend_table_if_needed(ws, header_row, model_col_idx):
+    """If 'Model Number' header belongs to an Excel Table, extend that table by one column (Items)."""
+    try:
+        # openpyxl stores tables in ws._tables (list)
+        for tbl in list(getattr(ws, "_tables", [])):
+            # parse table ref
+            ref = tbl.ref  # e.g., 'A1:Q100'
+            parsed = _parse_ref(ref)
+            if not parsed: 
+                continue
+            sc, sr, ec, er = parsed
+            start_col_idx = column_index_from_string(sc)
+            end_col_idx = column_index_from_string(ec)
+            # header row must match
+            if sr != header_row:
+                continue
+            # Does model_col_idx fall inside this table's columns?
+            if not (start_col_idx <= model_col_idx <= end_col_idx):
+                continue
+            # Extend table by one column on the right
+            new_end_col_idx = end_col_idx + 1
+            new_ref = f"{sc}{sr}:{get_column_letter(new_end_col_idx)}{er}"
+            tbl.ref = new_ref
+            # Add a new TableColumn at the end with name 'Items'
+            # Ensure unique id
+            max_id = 0
+            for col in tbl.tableColumns._tableColumns:
+                max_id = max(max_id, int(col.id))
+            new_col = TableColumn(id=max_id+1, name="Items")
+            tbl.tableColumns._tableColumns.append(new_col)
+            # Done for this table (a header can belong to only one table)
+            break
     except Exception:
         pass
 
@@ -85,6 +134,7 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                 break
         if model_col_idx is None:
             continue
+        # Remember original max column & filter/table refs
         mn_letter = get_column_letter(model_col_idx)
         mn_width = ws.column_dimensions[mn_letter].width
         insert_at = model_col_idx + 1
@@ -96,6 +146,7 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
         except Exception:
             pass
         ws.column_dimensions[get_column_letter(insert_at)].width = mn_width if mn_width else 15
+        # Fill values & highlight
         for r in range(2, ws.max_row + 1):
             raw = ws.cell(row=r, column=model_col_idx).value
             text = (str(raw).strip()) if raw is not None else ""
@@ -119,7 +170,10 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
             if has_na:
                 for c in range(1, ws.max_column + 1):
                     ws.cell(row=r, column=c).fill = red_fill
-        extend_autofilter_to_last_col(ws)
+        # Only widen auto filter horizontally, keep original rows intact
+        widen_filter_columns_only(ws)
+        # If inside a Table, extend table to include new Items column (preserve totals & formulas)
+        extend_table_if_needed(ws, header_row, model_col_idx)
     out = BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -131,12 +185,9 @@ if run:
     try:
         b_df = pd.read_excel(file_b)
         processed = process_workbook(file_a.read(), b_df)
-
-        # Dynamic output name: <A filename>_update.xlsx
         base_name = file_a.name.rsplit(".", 1)[0] if file_a.name else "A_matched"
         out_name = f"{base_name}_update.xlsx"
-
-        st.success("Done! Formatting preserved as much as possible.")
+        st.success("Done! Formatting & totals preserved as much as possible.")
         st.download_button("⬇️ Download result", data=processed,
                            file_name=out_name,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
