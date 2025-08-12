@@ -8,13 +8,30 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 st.set_page_config(page_title="Model Number → Items Matcher (Preserve Format)", layout="wide")
-st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.5 – append at sheet end)")
+st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.6)")
 
-st.markdown("""
-**Change in v3.5**  
-- To avoid side effects on merged cells / totals, the new **Items** column is now **appended as the last column of the sheet**, not inserted after *Model Number*.  
-- We still copy header/body styles from the *Model Number* column so the new column blends in visually.  
-- Filters are widened **horizontally only** to include the new last column. Rows are not expanded; no blank gridlines at the bottom.
+with st.expander("📘 Usage Instructions (click to expand)"):
+    st.markdown("""
+**What this tool does**
+- Edits your uploaded **File A** *in place* to preserve formatting (styles, widths, filters, freeze panes, merged cells).
+- Adds a new **Items** column **at the end of each sheet** that has a `Model Number` header (case-insensitive).
+
+**How to use**
+1. **Upload File A** — Excel to be matched (multi-sheet supported).
+2. **Upload File B** — Mapping file with **2 columns**: `Model Number`, `Items`.
+3. Click **Run Matching (Preserve Format)**.
+4. Download the result named **`<FileA>_update.xlsx`**.
+
+**Matching rules**
+- Split multiple models in a cell by comma (`,` or `，`), and process each token.
+- Ignore leading quantities like `49 x ...`, `289*...`.
+- For each token, find the **longest** `Model Number` in File B that is **contained** in the token (case-insensitive).
+- If a token has no match → `N/A`. If any token is `N/A`, the **entire row** is highlighted red.
+
+**Formatting rules**
+- The new **Items** column is **appended to the last column** to avoid shifting your existing columns/merge/formulas.
+- Header and body styles of the new column are copied from the `Model Number` column so borders align.
+- Filter ranges are widened **horizontally only** to include the new column. Bottom blank rows are not touched.
 """)
 
 with st.sidebar:
@@ -24,10 +41,10 @@ with st.sidebar:
     run = st.button("🚀 Run Matching (Preserve Format)", use_container_width=True)
 
 def _clean_leading_qty(txt: str) -> str:
-    return re.sub(r"^\s*\\d+\\s*[x\\*]\\s*", "", txt, flags=re.IGNORECASE)
+    return re.sub(r"^\s*\d+\s*[x\*]\s*", "", txt, flags=re.IGNORECASE)
 
 def _split_models(cell: str):
-    parts = re.split(r"[,\\，]", cell)
+    parts = re.split(r"[,\，]", cell)
     return [p.strip() for p in parts if p.strip()]
 
 def _norm_cols(cols):
@@ -62,9 +79,8 @@ def longest_substring_match(token: str, keys_sorted, keys_sorted_lower):
 
 def _parse_ref(ref: str):
     a, b = ref.split(":")
-    import re as _re
-    m1 = _re.match(r"([A-Z]{1,3})(\\d+)", a)
-    m2 = _re.match(r"([A-Z]{1,3})(\\d+)", b)
+    m1 = re.match(r"([A-Z]{1,3})(\d+)", a)
+    m2 = re.match(r"([A-Z]{1,3})(\d+)", b)
     if not (m1 and m2):
         return None
     return m1.group(1), int(m1.group(2)), m2.group(1), int(m2.group(2))
@@ -104,26 +120,24 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
         if model_col_idx is None:
             continue
 
-        # Capture a body style from the row below header in the Model Number column
+        # Copy one body style from "Model Number" column second row
         body_style = None
         if ws.max_row >= header_row + 1:
             body_style = ws.cell(row=header_row + 1, column=model_col_idx)._style
 
-        # Determine append position (= last column + 1)
+        # Append to the end
         insert_at = ws.max_column + 1
         header_cell = ws.cell(row=header_row, column=insert_at)
         header_cell.value = "Items"
-        # Copy header style & set a reasonable width
         try:
             header_cell._style = model_header_style
         except Exception:
             pass
-        from openpyxl.utils import get_column_letter
-        ws.column_dimensions[get_column_letter(insert_at)].width = ws.column_dimensions[get_column_letter(model_col_idx)].width or 15
+        ws.column_dimensions[get_column_letter(insert_at)].width = (
+            ws.column_dimensions[get_column_letter(model_col_idx)].width or 15
+        )
 
-        # Only process to last non-empty row in Model Number
         last_row = last_data_row_in_column(ws, model_col_idx, start_row=header_row + 1)
-
         for r in range(header_row + 1, last_row + 1):
             raw = ws.cell(row=r, column=model_col_idx).value
             text = (str(raw).strip()) if raw is not None else ""
@@ -153,7 +167,6 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                 for c in range(1, ws.max_column + 1):
                     ws.cell(row=r, column=c).fill = red_fill
 
-        # Widen filter range horizontally only
         widen_filter_columns_only(ws)
 
     out = BytesIO()
@@ -169,7 +182,7 @@ if run:
         processed = process_workbook(file_a.read(), b_df)
         base_name = file_a.name.rsplit(".", 1)[0] if file_a.name else "A_matched"
         out_name = f"{base_name}_update.xlsx"
-        st.success("Done! Items column appended at the end to avoid merged/total issues.")
+        st.success("Done! Items column is appended at the end, formatting preserved.")
         st.download_button("⬇️ Download result", data=processed,
                            file_name=out_name,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
