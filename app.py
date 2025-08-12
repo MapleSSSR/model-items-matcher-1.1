@@ -9,14 +9,12 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.table import TableColumn
 
 st.set_page_config(page_title="Model Number → Items Matcher (Preserve Format)", layout="wide")
-st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.4)")
+st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.4.1)")
 
 st.markdown("""
-**What's new in v3.4**  
-- **No more blank gridlines**: we only process up to the **last non-empty Model Number row**, so we don't touch empty rows at the bottom.  
-- **Keep totals working**: after inserting the column, we adjust formulas that reference columns to the right (e.g. `SUM(R:R)` becomes `SUM(S:S)`).  
-- **Consistent look**: the new **Items** column copies the body style from **Model Number** so borders align with neighboring columns.  
-- Still includes: longest **substring** match, whole-row red highlight on `N/A`, ignore leading quantities, multi-models with commas, preserve filters/tables.
+**Hotfix v3.4.1**  
+- Fixed a regex compile error introduced in v3.4.  
+- Keeps all v3.4 improvements: adjust formulas to the right of the inserted column, avoid styling blank tail rows, copy borders/styles for the new **Items** column, preserve filters & tables, longest substring match with whole-row red highlight on `N/A`.
 """)
 
 with st.sidebar:
@@ -26,7 +24,7 @@ with st.sidebar:
     run = st.button("🚀 Run Matching (Preserve Format)", use_container_width=True)
 
 def _clean_leading_qty(txt: str) -> str:
-    return re.sub(r"^\\s*\\d+\\s*[x\\*]\\s*", "", txt, flags=re.IGNORECASE)
+    return re.sub(r"^\s*\d+\s*[x\*]\s*", "", txt, flags=re.IGNORECASE)
 
 def _split_models(cell: str):
     parts = re.split(r"[,\，]", cell)
@@ -64,8 +62,8 @@ def longest_substring_match(token: str, keys_sorted, keys_sorted_lower):
 
 def _parse_ref(ref: str):
     a, b = ref.split(":")
-    m1 = re.match(r"([A-Z]+)(\d+)", a)
-    m2 = re.match(r"([A-Z]+)(\d+)", b)
+    m1 = re.match(r"([A-Z]{1,3})(\d+)", a)
+    m2 = re.match(r"([A-Z]{1,3})(\d+)", b)
     if not (m1 and m2):
         return None
     return m1.group(1), int(m1.group(2)), m2.group(1), int(m2.group(2))
@@ -104,22 +102,27 @@ def extend_table_if_needed(ws, header_row, model_col_idx):
     except Exception:
         pass
 
-# Formula shifting: bump any A1/R1C1-style references by +delta columns if their column >= insert_at
-_cell_ref_re = re.compile(r"(\\$?)([A-Z]{1,3})(\\$?)(\\d+)")
-_col_only_re = re.compile(r"(\\$?)([A-Z]{1,3})(\\$?)\\s*:\\s*(\\$?)([A-Z]{1,3})(\\$?)")  # e.g., R:S or $R:$S
+# ✅ Correct regex patterns (single backslashes, escape $ properly)
+_cell_ref_re = re.compile(r"(\$?)([A-Z]{1,3})(\$?)(\d+)")
+_col_only_re = re.compile(r"(\$?)([A-Z]{1,3})(\$?)\s*:\s*(\$?)([A-Z]{1,3})(\$?)")
 
 def shift_formula_by_col(formula: str, insert_at_col: int, delta: int = 1) -> str:
     # Skip structured references/tables (contain '[' or ']')
     if "[" in formula and "]" in formula:
         return formula
 
+    def col_to_index(col_letters: str) -> int:
+        return column_index_from_string(col_letters)
+
+    def index_to_col(idx: int) -> str:
+        return get_column_letter(idx)
+
     def shift_col(col_letters: str) -> str:
-        idx = column_index_from_string(col_letters)
+        idx = col_to_index(col_letters)
         if idx >= insert_at_col:
-            return get_column_letter(idx + delta)
+            return index_to_col(idx + delta)
         return col_letters
 
-    # First handle column-only ranges like R:S
     def repl_colrange(m):
         l1, c1, a1, l2, c2, a2 = m.groups()
         nc1 = shift_col(c1)
@@ -128,7 +131,6 @@ def shift_formula_by_col(formula: str, insert_at_col: int, delta: int = 1) -> st
 
     formula2 = _col_only_re.sub(repl_colrange, formula)
 
-    # Then handle full refs like R2, $R$10
     def repl_cell(m):
         abs_col, col, abs_row, row = m.groups()
         new_col = shift_col(col)
@@ -138,7 +140,6 @@ def shift_formula_by_col(formula: str, insert_at_col: int, delta: int = 1) -> st
     return formula3
 
 def last_data_row_in_column(ws, col_idx: int, start_row: int = 2) -> int:
-    # Scan upward from bottom until find a non-empty cell in 'Model Number' column
     for r in range(ws.max_row, start_row - 1, -1):
         val = ws.cell(row=r, column=col_idx).value
         if val not in (None, ""):
@@ -162,12 +163,11 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
         if model_col_idx is None:
             continue
 
-        # Capture body style from the row below header, same column (if exists)
+        # Copy one body style from below header
         body_style = None
         if ws.max_row >= header_row + 1:
             body_style = ws.cell(row=header_row + 1, column=model_col_idx)._style
 
-        # Insert column
         mn_letter = get_column_letter(model_col_idx)
         mn_width = ws.column_dimensions[mn_letter].width
         insert_at = model_col_idx + 1
@@ -180,7 +180,7 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
             pass
         ws.column_dimensions[get_column_letter(insert_at)].width = mn_width if mn_width else 15
 
-        # Adjust formulas on sheet (cells with '=' in value)
+        # Adjust formulas sheet-wide
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
             for cell in row:
                 val = cell.value
@@ -189,14 +189,13 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                     if newf != val:
                         cell.value = newf
 
-        # Process only up to the last data row in Model Number column
         last_row = last_data_row_in_column(ws, model_col_idx, start_row=header_row + 1)
 
         for r in range(header_row + 1, last_row + 1):
             raw = ws.cell(row=r, column=model_col_idx).value
             text = (str(raw).strip()) if raw is not None else ""
             if text == "":
-                continue  # do not touch empty trailing rows
+                continue
             cleaned = _clean_leading_qty(text)
             parts = _split_models(cleaned)
             out_items = []
@@ -212,7 +211,6 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                         has_na = True
             tgt = ws.cell(row=r, column=insert_at)
             tgt.value = ",".join(out_items)
-            # Copy body style so borders look consistent
             try:
                 if body_style is not None:
                     tgt._style = body_style
