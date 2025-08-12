@@ -6,15 +6,15 @@ from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, column_index_from_string
-from openpyxl.worksheet.table import TableColumn
 
 st.set_page_config(page_title="Model Number → Items Matcher (Preserve Format)", layout="wide")
-st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.4.1)")
+st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.5 – append at sheet end)")
 
 st.markdown("""
-**Hotfix v3.4.1**  
-- Fixed a regex compile error introduced in v3.4.  
-- Keeps all v3.4 improvements: adjust formulas to the right of the inserted column, avoid styling blank tail rows, copy borders/styles for the new **Items** column, preserve filters & tables, longest substring match with whole-row red highlight on `N/A`.
+**Change in v3.5**  
+- To avoid side effects on merged cells / totals, the new **Items** column is now **appended as the last column of the sheet**, not inserted after *Model Number*.  
+- We still copy header/body styles from the *Model Number* column so the new column blends in visually.  
+- Filters are widened **horizontally only** to include the new last column. Rows are not expanded; no blank gridlines at the bottom.
 """)
 
 with st.sidebar:
@@ -24,10 +24,10 @@ with st.sidebar:
     run = st.button("🚀 Run Matching (Preserve Format)", use_container_width=True)
 
 def _clean_leading_qty(txt: str) -> str:
-    return re.sub(r"^\s*\d+\s*[x\*]\s*", "", txt, flags=re.IGNORECASE)
+    return re.sub(r"^\s*\\d+\\s*[x\\*]\\s*", "", txt, flags=re.IGNORECASE)
 
 def _split_models(cell: str):
-    parts = re.split(r"[,\，]", cell)
+    parts = re.split(r"[,\\，]", cell)
     return [p.strip() for p in parts if p.strip()]
 
 def _norm_cols(cols):
@@ -62,8 +62,9 @@ def longest_substring_match(token: str, keys_sorted, keys_sorted_lower):
 
 def _parse_ref(ref: str):
     a, b = ref.split(":")
-    m1 = re.match(r"([A-Z]{1,3})(\d+)", a)
-    m2 = re.match(r"([A-Z]{1,3})(\d+)", b)
+    import re as _re
+    m1 = _re.match(r"([A-Z]{1,3})(\\d+)", a)
+    m2 = _re.match(r"([A-Z]{1,3})(\\d+)", b)
     if not (m1 and m2):
         return None
     return m1.group(1), int(m1.group(2)), m2.group(1), int(m2.group(2))
@@ -78,66 +79,6 @@ def widen_filter_columns_only(ws):
             ws.auto_filter.ref = f"{sc}{sr}:{new_end_col}{er}"
     except Exception:
         pass
-
-def extend_table_if_needed(ws, header_row, model_col_idx):
-    try:
-        for tbl in list(getattr(ws, "_tables", [])):
-            parsed = _parse_ref(tbl.ref)
-            if not parsed: 
-                continue
-            sc, sr, ec, er = parsed
-            start_col_idx = column_index_from_string(sc)
-            end_col_idx = column_index_from_string(ec)
-            if sr != header_row:
-                continue
-            if not (start_col_idx <= model_col_idx <= end_col_idx):
-                continue
-            new_end_col_idx = end_col_idx + 1
-            tbl.ref = f"{sc}{sr}:{get_column_letter(new_end_col_idx)}{er}"
-            max_id = 0
-            for col in tbl.tableColumns._tableColumns:
-                max_id = max(max_id, int(col.id))
-            tbl.tableColumns._tableColumns.append(TableColumn(id=max_id+1, name="Items"))
-            break
-    except Exception:
-        pass
-
-# ✅ Correct regex patterns (single backslashes, escape $ properly)
-_cell_ref_re = re.compile(r"(\$?)([A-Z]{1,3})(\$?)(\d+)")
-_col_only_re = re.compile(r"(\$?)([A-Z]{1,3})(\$?)\s*:\s*(\$?)([A-Z]{1,3})(\$?)")
-
-def shift_formula_by_col(formula: str, insert_at_col: int, delta: int = 1) -> str:
-    # Skip structured references/tables (contain '[' or ']')
-    if "[" in formula and "]" in formula:
-        return formula
-
-    def col_to_index(col_letters: str) -> int:
-        return column_index_from_string(col_letters)
-
-    def index_to_col(idx: int) -> str:
-        return get_column_letter(idx)
-
-    def shift_col(col_letters: str) -> str:
-        idx = col_to_index(col_letters)
-        if idx >= insert_at_col:
-            return index_to_col(idx + delta)
-        return col_letters
-
-    def repl_colrange(m):
-        l1, c1, a1, l2, c2, a2 = m.groups()
-        nc1 = shift_col(c1)
-        nc2 = shift_col(c2)
-        return f"{l1}{nc1}{a1}:{l2}{nc2}{a2}"
-
-    formula2 = _col_only_re.sub(repl_colrange, formula)
-
-    def repl_cell(m):
-        abs_col, col, abs_row, row = m.groups()
-        new_col = shift_col(col)
-        return f"{abs_col}{new_col}{abs_row}{row}"
-
-    formula3 = _cell_ref_re.sub(repl_cell, formula2)
-    return formula3
 
 def last_data_row_in_column(ws, col_idx: int, start_row: int = 2) -> int:
     for r in range(ws.max_row, start_row - 1, -1):
@@ -163,32 +104,24 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
         if model_col_idx is None:
             continue
 
-        # Copy one body style from below header
+        # Capture a body style from the row below header in the Model Number column
         body_style = None
         if ws.max_row >= header_row + 1:
             body_style = ws.cell(row=header_row + 1, column=model_col_idx)._style
 
-        mn_letter = get_column_letter(model_col_idx)
-        mn_width = ws.column_dimensions[mn_letter].width
-        insert_at = model_col_idx + 1
-        ws.insert_cols(insert_at, 1)
+        # Determine append position (= last column + 1)
+        insert_at = ws.max_column + 1
         header_cell = ws.cell(row=header_row, column=insert_at)
         header_cell.value = "Items"
+        # Copy header style & set a reasonable width
         try:
             header_cell._style = model_header_style
         except Exception:
             pass
-        ws.column_dimensions[get_column_letter(insert_at)].width = mn_width if mn_width else 15
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions[get_column_letter(insert_at)].width = ws.column_dimensions[get_column_letter(model_col_idx)].width or 15
 
-        # Adjust formulas sheet-wide
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-            for cell in row:
-                val = cell.value
-                if isinstance(val, str) and val.startswith("="):
-                    newf = shift_formula_by_col(val, insert_at_col=insert_at, delta=1)
-                    if newf != val:
-                        cell.value = newf
-
+        # Only process to last non-empty row in Model Number
         last_row = last_data_row_in_column(ws, model_col_idx, start_row=header_row + 1)
 
         for r in range(header_row + 1, last_row + 1):
@@ -220,8 +153,8 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                 for c in range(1, ws.max_column + 1):
                     ws.cell(row=r, column=c).fill = red_fill
 
+        # Widen filter range horizontally only
         widen_filter_columns_only(ws)
-        extend_table_if_needed(ws, header_row, model_col_idx)
 
     out = BytesIO()
     wb.save(out)
@@ -236,7 +169,7 @@ if run:
         processed = process_workbook(file_a.read(), b_df)
         base_name = file_a.name.rsplit(".", 1)[0] if file_a.name else "A_matched"
         out_name = f"{base_name}_update.xlsx"
-        st.success("Done! Formatting, totals and borders preserved as much as possible.")
+        st.success("Done! Items column appended at the end to avoid merged/total issues.")
         st.download_button("⬇️ Download result", data=processed,
                            file_name=out_name,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
