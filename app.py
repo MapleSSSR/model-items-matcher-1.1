@@ -5,16 +5,17 @@ import streamlit as st
 from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Model Number → Items Matcher (Preserve Format)", layout="wide")
-st.title("🔗 Model Number → Items Matcher · Preserve Original Formatting (v3.6)")
+st.set_page_config(page_title="Model Number / SKU → Items Matcher (Preserve Format)", layout="wide")
+st.title("🔗 Model Number / SKU → Items Matcher · Preserve Original Formatting (v3.7)")
 
 with st.expander("📘 Usage Instructions (click to expand)"):
     st.markdown("""
 **What this tool does**
 - Edits your uploaded **File A** *in place* to preserve formatting (styles, widths, filters, freeze panes, merged cells).
-- Adds a new **Items** column **at the end of each sheet** that has a `Model Number` header (case-insensitive).
+- Adds a new **Items** column **at the end of each sheet** that has a header exactly **`Model Number`** or **`SKU`** (case-insensitive).  
+  *Note:* Columns like **`FN SKU`**, **`FNSKU`**, etc. are **not** matched.
 
 **How to use**
 1. **Upload File A** — Excel to be matched (multi-sheet supported).
@@ -30,7 +31,7 @@ with st.expander("📘 Usage Instructions (click to expand)"):
 
 **Formatting rules**
 - The new **Items** column is **appended to the last column** to avoid shifting your existing columns/merge/formulas.
-- Header and body styles of the new column are copied from the `Model Number` column so borders align.
+- Header and body styles of the new column are copied from the detected header column so borders align.
 - Filter ranges are widened **horizontally only** to include the new column. Bottom blank rows are not touched.
 """)
 
@@ -77,25 +78,6 @@ def longest_substring_match(token: str, keys_sorted, keys_sorted_lower):
             return k
     return None
 
-def _parse_ref(ref: str):
-    a, b = ref.split(":")
-    m1 = re.match(r"([A-Z]{1,3})(\d+)", a)
-    m2 = re.match(r"([A-Z]{1,3})(\d+)", b)
-    if not (m1 and m2):
-        return None
-    return m1.group(1), int(m1.group(2)), m2.group(1), int(m2.group(2))
-
-def widen_filter_columns_only(ws):
-    try:
-        if ws.auto_filter and ws.auto_filter.ref:
-            parsed = _parse_ref(ws.auto_filter.ref)
-            if not parsed: return
-            sc, sr, ec, er = parsed
-            new_end_col = get_column_letter(ws.max_column)
-            ws.auto_filter.ref = f"{sc}{sr}:{new_end_col}{er}"
-    except Exception:
-        pass
-
 def last_data_row_in_column(ws, col_idx: int, start_row: int = 2) -> int:
     for r in range(ws.max_row, start_row - 1, -1):
         val = ws.cell(row=r, column=col_idx).value
@@ -110,36 +92,42 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
     wb = load_workbook(BytesIO(a_bytes))
     for ws in wb.worksheets:
         header_row = 1
-        model_col_idx = None
-        model_header_style = None
+        key_col_idx = None
+        header_style = None
+
+        # ✅ EXACT header match: "model number" OR "sku" only
         for cell in ws[header_row]:
-            if cell.value and str(cell.value).strip().lower() == "model number":
-                model_col_idx = cell.column
-                model_header_style = cell._style
+            if not cell.value:
+                continue
+            v = str(cell.value).strip().lower()
+            if v == "model number" or v == "sku":
+                key_col_idx = cell.column
+                header_style = cell._style
                 break
-        if model_col_idx is None:
+
+        if key_col_idx is None:
             continue
 
-        # Copy one body style from "Model Number" column second row
+        # Copy one body style from the second row of the key column
         body_style = None
         if ws.max_row >= header_row + 1:
-            body_style = ws.cell(row=header_row + 1, column=model_col_idx)._style
+            body_style = ws.cell(row=header_row + 1, column=key_col_idx)._style
 
-        # Append to the end
+        # Append Items as last column
         insert_at = ws.max_column + 1
         header_cell = ws.cell(row=header_row, column=insert_at)
         header_cell.value = "Items"
         try:
-            header_cell._style = model_header_style
+            header_cell._style = header_style
         except Exception:
             pass
         ws.column_dimensions[get_column_letter(insert_at)].width = (
-            ws.column_dimensions[get_column_letter(model_col_idx)].width or 15
+            ws.column_dimensions[get_column_letter(key_col_idx)].width or 15
         )
 
-        last_row = last_data_row_in_column(ws, model_col_idx, start_row=header_row + 1)
+        last_row = last_data_row_in_column(ws, key_col_idx, start_row=header_row + 1)
         for r in range(header_row + 1, last_row + 1):
-            raw = ws.cell(row=r, column=model_col_idx).value
+            raw = ws.cell(row=r, column=key_col_idx).value
             text = (str(raw).strip()) if raw is not None else ""
             if text == "":
                 continue
@@ -167,7 +155,18 @@ def process_workbook(a_bytes: bytes, b_df: pd.DataFrame) -> bytes:
                 for c in range(1, ws.max_column + 1):
                     ws.cell(row=r, column=c).fill = red_fill
 
-        widen_filter_columns_only(ws)
+        # Widen filter range horizontally only (if a filter exists)
+        try:
+            if ws.auto_filter and ws.auto_filter.ref:
+                ref = ws.auto_filter.ref
+                # keep original rows; only extend the end column
+                import re as _re
+                m1 = _re.match(r"([A-Z]{1,3})(\d+):([A-Z]{1,3})(\d+)", ref or "")
+                if m1:
+                    sc, sr, ec, er = m1.groups()
+                    ws.auto_filter.ref = f"{sc}{sr}:{get_column_letter(ws.max_column)}{er}"
+        except Exception:
+            pass
 
     out = BytesIO()
     wb.save(out)
@@ -182,7 +181,7 @@ if run:
         processed = process_workbook(file_a.read(), b_df)
         base_name = file_a.name.rsplit(".", 1)[0] if file_a.name else "A_matched"
         out_name = f"{base_name}_update.xlsx"
-        st.success("Done! Items column is appended at the end, formatting preserved.")
+        st.success("Done! Items column appended at the end. Exact header match: 'Model Number' or 'SKU'.")
         st.download_button("⬇️ Download result", data=processed,
                            file_name=out_name,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
